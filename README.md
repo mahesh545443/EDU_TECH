@@ -32,8 +32,12 @@
 ### Chat Bot Streamlit App  
 📜 [View Script](https://github.com/mahesh545443/analytics_avenue/blob/main/chat_bot_streamlit.py)
 
-### Chat Bot Streamlit App  
-📜 [View Script](https://github.com/mahesh545443/analytics_avenue/blob/main/chat_bot_streamlit.py)
+
+
+### Multimodel (Python Script)  
+📜 [View Script](https://github.com/mahesh545443/analytics_avenue/blob/main/multimodel.py)
+
+
 
 ### Multiple Files Chat Bot  
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mahesh545443/analytics_avenue/blob/main/multiple_files_chat_bot.ipynb)
