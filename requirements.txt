@@ -1,13 +1,5 @@
-
-
 requests
-
 pymongo
-PyPDFLoader
-
-
-sentence-transformers
-pypdf
 streamlit==1.37.1
 openai==1.45.0
 langchain==0.2.14
@@ -15,4 +7,5 @@ langchain-community==0.2.12
 chromadb==0.5.3
 sentence-transformers==2.7.0
 pypdf==4.3.1
+
 
