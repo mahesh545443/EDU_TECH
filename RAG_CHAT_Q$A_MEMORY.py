@@ -1,5 +1,3 @@
-# RAG_CHAT_Q$A_MEMORY.py
-# RAG_CHAT_Q$A_MEMORY.py
 import os
 # disable aggressive file watching (must be set before importing streamlit)
 os.environ["WATCHFILES_DISABLE"] = "1"
@@ -13,16 +11,20 @@ import streamlit as st
 from pathlib import Path
 from typing import Union
 
-# LangChain community imports (for loaders & vector DB)
+# LangChain community imports (for loaders & splitting)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import SentenceTransformerEmbeddings
+
+# chromadb (we force duckdb+parquet backend to avoid SQLite issues on some systems)
+import chromadb
+from chromadb.config import Settings
 
 
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
         # embedding model (sentence-transformers)
+        # Using the same model you had originally
         self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
         # Where vector DBs are stored (relative to app directory)
@@ -45,6 +47,14 @@ class PDFProcessor:
         # OpenRouter endpoint (Chat Completions)
         self.openrouter_endpoint = "https://openrouter.ai/api/v1/chat/completions"
 
+    def _get_chroma_client(self, vector_path: str):
+        """Return a chromadb.PersistentClient pointed at vector_path using duckdb+parquet backend."""
+        # ensure directory exists
+        Path(vector_path).mkdir(parents=True, exist_ok=True)
+        settings = Settings(chroma_db_impl="duckdb+parquet")
+        client = chromadb.PersistentClient(path=str(vector_path), settings=settings)
+        return client
+
     def _save_uploaded_pdf(self, uploaded_file) -> str:
         suffix = ".pdf"
         tmp_name = f"{uuid.uuid4().hex}{suffix}"
@@ -56,7 +66,12 @@ class PDFProcessor:
         return str(file_path)
 
     def process_pdf(self, pdf_source: Union[str, "UploadedFile"]):
-        """Process PDF and create or reuse a Chroma vector DB. Returns vector_path or None."""
+        """Process PDF and create or reuse a Chroma (chromadb) vector DB. Returns vector_path or None.
+
+        Key changes from the original:
+        - Uses chromadb.PersistentClient with duckdb+parquet backend (avoids SQLite issues)
+        - Stores documents and precomputed embeddings directly into a chromadb collection
+        """
         is_temp = False
         pdf_path = None
         try:
@@ -84,16 +99,44 @@ class PDFProcessor:
             text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             chunks = text_splitter.split_documents(documents)
 
+            # Prepare data lists
+            docs_texts = [c.page_content for c in chunks]
+            metadatas = [getattr(c, "metadata", {}) or {} for c in chunks]
+            ids = [f"{db_name}_{i}_{uuid.uuid4().hex}" for i in range(len(chunks))]
+
+            # Compute embeddings (with fallback if method names vary)
+            if hasattr(self.embeddings, "embed_documents"):
+                vectors = self.embeddings.embed_documents(docs_texts)
+            elif hasattr(self.embeddings, "embed"):
+                vectors = [self.embeddings.embed(d) for d in docs_texts]
+            else:
+                raise RuntimeError("Embedding method not available on SentenceTransformerEmbeddings instance")
+
             # Ensure vector folder exists before writing
             os.makedirs(vector_path, exist_ok=True)
 
-            # Build Chroma DB using new 'embedding' kwarg
-            vectordb = Chroma.from_documents(
-                documents=chunks,
-                embedding=self.embeddings,
-                persist_directory=vector_path
-            )
-            vectordb.persist()
+            # Create chromadb client (duckdb backend) and collection
+            client = self._get_chroma_client(vector_path)
+            collection_name = db_name.replace(" ", "_")
+
+            # get_or_create_collection is convenient; it will return existing collection or create new
+            try:
+                collection = client.get_or_create_collection(name=collection_name)
+            except Exception:
+                # fallback for older chromadb versions
+                try:
+                    collection = client.get_collection(name=collection_name)
+                except Exception:
+                    collection = client.create_collection(name=collection_name)
+
+            # Add documents with precomputed embeddings
+            collection.add(documents=docs_texts, metadatas=metadatas, ids=ids, embeddings=vectors)
+            # persist to disk
+            try:
+                client.persist()
+            except Exception:
+                # some chromadb builds persist automatically; ignore if not available
+                pass
 
             # mark processed
             with open(flag_path, "w") as f:
@@ -150,11 +193,9 @@ class PDFProcessor:
                 if isinstance(content, str):
                     return True, content
                 if isinstance(content, dict):
-                    # sometimes {'type':'text','text':'...'}
                     if "text" in content:
                         return True, content["text"]
                 if isinstance(content, list):
-                    # list of parts -> join text-like parts
                     parts = []
                     for part in content:
                         if isinstance(part, str):
@@ -164,7 +205,6 @@ class PDFProcessor:
                             if isinstance(text, str):
                                 parts.append(text)
                     return True, "\n".join(parts)
-            # fallback to choice["text"]
             if "text" in choice:
                 return True, choice["text"]
             return False, f"Unexpected response shape: {json.dumps(choice)[:400]}"
@@ -175,15 +215,51 @@ class PDFProcessor:
         if not os.path.exists(vector_path):
             return "Vector DB not found at specified path."
 
-        # Use new 'embedding' kwarg when creating Chroma client
-        vectordb = Chroma(persist_directory=vector_path, embedding=self.embeddings)
+        # Create chromadb client pointed at the vector_path
+        try:
+            client = self._get_chroma_client(vector_path)
+        except Exception as e:
+            return f"[CHROMA ERROR] Could not initialize chroma client: {e}"
 
-        results = vectordb.similarity_search(question, k=3)
-        if not results:
-            return "No relevant information found."
+        collection_name = Path(vector_path).stem.replace(" ", "_")
 
-        context = "\n\n".join([r.page_content for r in results])
+        try:
+            # Try to fetch the collection
+            collection = client.get_collection(name=collection_name)
+        except Exception:
+            # If it doesn't exist or something went wrong, return an informative message
+            return "No vector collection found for this PDF. Make sure the PDF was processed successfully."
 
+        # Compute embedding for the question (fallback if method names vary)
+        try:
+            if hasattr(self.embeddings, "embed_query"):
+                q_emb = self.embeddings.embed_query(question)
+            elif hasattr(self.embeddings, "embed_documents"):
+                q_emb = self.embeddings.embed_documents([question])[0]
+            elif hasattr(self.embeddings, "embed"):
+                q_emb = self.embeddings.embed(question)
+            else:
+                raise RuntimeError("Embedding method not available for query")
+        except Exception as e:
+            return f"[EMBED ERROR] {e}"
+
+        # Query chroma collection
+        try:
+            resp = collection.query(query_embeddings=[q_emb], n_results=3, include=["documents", "metadatas", "distances"]) 
+            # resp shape is typically {'ids': [[...]], 'documents': [[...]], 'metadatas': [[...]], 'distances': [[...]]}
+            docs = []
+            if isinstance(resp, dict):
+                docs = resp.get("documents", [[]])[0] if resp.get("documents") else []
+            # ensure we have results
+            if not docs:
+                return "No relevant information found."
+
+            context = "\n\n".join(docs)
+
+        except Exception as e:
+            return f"[SEARCH ERROR] {e}"
+
+        # Build messages and call LLM
         messages = [
             {
                 "role": "system",
@@ -216,13 +292,13 @@ processor = PDFProcessor()
 
 # Sidebar / settings
 st.sidebar.header("⚙️ Settings")
-model_choice = st.sidebar.selectbox("Choose model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"])
+model_choice = st.sidebar.selectbox("Choose model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"]) 
 st.sidebar.markdown("Vector DBs saved under `analytics_chroma/` in the app folder.")
 st.sidebar.markdown("Add `OPENROUTER_API_KEY` in Streamlit Secrets before using the model.")
 
 # Upload / sample selection
 st.subheader("Upload or select a PDF")
-uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"])
+uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"]) 
 
 sample_path = Path("sample_pdfs")
 sample_pdfs = []
@@ -296,10 +372,3 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
-
-
-
-
-
-
-
