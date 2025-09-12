@@ -1,5 +1,4 @@
-# RAG_CHAT_Q$A_MEMORY.py — updated for Streamlit Cloud (SQLite/Chroma + embeddings fix)
-# RAG_CHAT_Q$A_MEMORY.py — final updated version for Streamlit Cloud
+# RAG_CHAT_Q$A_MEMORY.py — final robust version for Streamlit Cloud
 import os
 
 # disable aggressive file watching (must be set before importing streamlit)
@@ -9,7 +8,6 @@ os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
 # --- Ensure a newer SQLite is used (pysqlite3-binary must be in requirements.txt) ---
 import sys
 try:
-    # prefer pysqlite3.dbapi2 if available
     import pysqlite3.dbapi2 as _pysqlite_dbapi
     sys.modules["sqlite3"] = _pysqlite_dbapi
 except Exception:
@@ -33,35 +31,48 @@ import streamlit as st
 from pathlib import Path
 from typing import Union
 
-# LangChain community imports (for loaders & vector DB)
-# (Import these AFTER the sqlite fix)
+# LangChain community imports (after sqlite fix)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 
-# Embeddings: prefer langchain-huggingface; fall back if necessary
+# Embeddings: prefer langchain-huggingface; fallback to others
 try:
     from langchain_huggingface import HuggingFaceEmbeddings as _HuggingFaceEmbeddings
     EmbeddingsClass = _HuggingFaceEmbeddings
 except Exception:
     try:
-        # older langchain layout fallback
         from langchain.embeddings import HuggingFaceEmbeddings as _HuggingFaceEmbeddings2
         EmbeddingsClass = _HuggingFaceEmbeddings2
     except Exception:
-        # last fallback to community sentence-transformer embeddings
+        # final fallback
         from langchain_community.embeddings import SentenceTransformerEmbeddings as _SentenceTransformerEmbeddings
         EmbeddingsClass = _SentenceTransformerEmbeddings
+
+# (optional) import sentence-transformers for fallback direct encoding
+try:
+    from sentence_transformers import SentenceTransformer
+    _SENTENCE_TRANSFORMER_AVAILABLE = True
+except Exception:
+    _SENTENCE_TRANSFORMER_AVAILABLE = False
 
 
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
-        # embedding model (sentence-transformers)
+        # Initialize embeddings object (handle different constructor signatures)
         try:
             self.embeddings = EmbeddingsClass(model_name="all-MiniLM-L6-v2")
         except TypeError:
-            # some wrappers accept positional arg
             self.embeddings = EmbeddingsClass("all-MiniLM-L6-v2")
+
+        # If sentence-transformers is available, prepare a direct model as a robust fallback
+        if _SENTENCE_TRANSFORMER_AVAILABLE:
+            try:
+                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                self._st_model = None
+        else:
+            self._st_model = None
 
         # Where vector DBs are stored (relative to app directory)
         if vector_db_root is None:
@@ -78,11 +89,116 @@ class PDFProcessor:
             api_key = None
         if not api_key:
             api_key = os.environ.get("OPENROUTER_API_KEY")
-        self.openrouter_api_key = api_key  # may be None (we handle that later)
+        self.openrouter_api_key = api_key
 
-        # OpenRouter endpoint (Chat Completions)
+        # OpenRouter endpoint
         self.openrouter_endpoint = "https://openrouter.ai/api/v1/chat/completions"
 
+    # ---------------- Embedding helper ----------------
+    def _embedding_fn(self, texts):
+        """
+        Robust embedding function that accepts either a single string or a list of strings.
+        Returns list-of-embeddings (each embedding is a list of floats) OR single embedding if input was string.
+        """
+        single_input = False
+        if isinstance(texts, str):
+            single_input = True
+            texts = [texts]
+
+        # Try common LangChain embedding method names in priority
+        try:
+            if hasattr(self.embeddings, "embed_documents"):
+                embs = self.embeddings.embed_documents(texts)
+            elif hasattr(self.embeddings, "embed_queries") and hasattr(self.embeddings, "embed_query"):
+                # some implementations have embed_query for single queries
+                embs = [self.embeddings.embed_query(t) for t in texts]
+            elif hasattr(self.embeddings, "embed_query"):
+                embs = [self.embeddings.embed_query(t) for t in texts]
+            elif hasattr(self.embeddings, "embed"):
+                # generic embed method
+                embs = self.embeddings.embed(texts)
+            else:
+                raise AttributeError("No known embed method on embeddings object")
+        except Exception:
+            # Fallback: use sentence-transformers directly if available
+            if self._st_model is not None:
+                try:
+                    arr = self._st_model.encode(texts)
+                    # arr may be ndarray; convert to list of lists
+                    if hasattr(arr, "tolist"):
+                        embs = arr.tolist()
+                    else:
+                        embs = [list(x) for x in arr]
+                except Exception as e:
+                    raise RuntimeError(f"Fallback sentence-transformers encoding failed: {e}")
+            else:
+                raise RuntimeError("Embedding failed and no sentence-transformers fallback available.")
+
+        # Ensure consistent return: list of lists or single list if input was single string
+        if single_input:
+            return embs[0] if isinstance(embs, list) else embs
+        return embs
+
+    # ---------------- Chroma helpers ----------------
+    def _create_chroma_from_documents(self, documents, persist_directory: str):
+        """
+        Try multiple ways to create a Chroma vectorstore from documents to support multiple versions.
+        """
+        errors = []
+        # Primary: prefer embedding_function param
+        try:
+            return Chroma.from_documents(documents=documents, embedding_function=self._embedding_fn, persist_directory=persist_directory)
+        except Exception as e:
+            errors.append(("embedding_function_from_documents", repr(e)))
+
+        # Fallback: older wrapper that accepts 'embedding' (embeddings object)
+        try:
+            return Chroma.from_documents(documents=documents, embedding=self.embeddings, persist_directory=persist_directory)
+        except Exception as e:
+            errors.append(("embedding_from_documents", repr(e)))
+
+        # Last fallback: try direct constructor + add_documents if available
+        try:
+            chroma_inst = Chroma(persist_directory=persist_directory)
+            if hasattr(chroma_inst, "add_documents"):
+                chroma_inst.add_documents(documents)
+                chroma_inst.persist()
+                return chroma_inst
+        except Exception as e:
+            errors.append(("constructor_add_documents", repr(e)))
+
+        raise RuntimeError(f"Could not create Chroma DB. Attempts: {errors}")
+
+    def _load_chroma_from_persist(self, persist_directory: str):
+        """
+        Try multiple ways to load an existing Chroma DB from disk.
+        """
+        errors = []
+        # Preferred factory
+        try:
+            return Chroma.from_persist_directory(persist_directory=persist_directory, embedding_function=self._embedding_fn)
+        except Exception as e:
+            errors.append(("from_persist_embedding_function", repr(e)))
+
+        # Older factory with embedding object
+        try:
+            return Chroma.from_persist_directory(persist_directory=persist_directory, embedding=self.embeddings)
+        except Exception as e:
+            errors.append(("from_persist_embedding", repr(e)))
+
+        # Fallback to constructor forms
+        try:
+            return Chroma(persist_directory=persist_directory, embedding_function=self._embedding_fn)
+        except Exception as e:
+            errors.append(("constructor_embedding_function", repr(e)))
+        try:
+            return Chroma(persist_directory=persist_directory, embedding=self.embeddings)
+        except Exception as e:
+            errors.append(("constructor_embedding", repr(e)))
+
+        raise RuntimeError(f"Could not load Chroma DB. Attempts: {errors}")
+
+    # ---------------- PDF processing ----------------
     def _save_uploaded_pdf(self, uploaded_file) -> str:
         suffix = ".pdf"
         tmp_name = f"{uuid.uuid4().hex}{suffix}"
@@ -125,13 +241,13 @@ class PDFProcessor:
             # Ensure vector folder exists before writing
             os.makedirs(vector_path, exist_ok=True)
 
-            # Build Chroma DB using embeddings object
-            vectordb = Chroma.from_documents(
-                documents=chunks,
-                embedding=self.embeddings,
-                persist_directory=vector_path
-            )
-            vectordb.persist()
+            # Build Chroma DB using embeddings object or embedding_function (robust)
+            vectordb = self._create_chroma_from_documents(chunks, vector_path)
+            # persist (if supported)
+            try:
+                vectordb.persist()
+            except Exception:
+                pass
 
             # mark processed
             with open(flag_path, "w") as f:
@@ -151,6 +267,7 @@ class PDFProcessor:
                     pass
             gc.collect()
 
+    # ---------------- OpenRouter call ----------------
     def _call_openrouter(self, messages: list, model: str = "openai/gpt-4o-mini", max_tokens: int = 600):
         """
         Direct HTTP call to OpenRouter chat completions. Returns (ok: bool, content_or_error).
@@ -181,18 +298,14 @@ class PDFProcessor:
         # extract content from known shapes
         try:
             choice = data["choices"][0]
-            # OpenRouter (OpenAI compatible) often uses choice["message"]["content"]
             msg = choice.get("message")
             if isinstance(msg, dict):
                 content = msg.get("content")
                 if isinstance(content, str):
                     return True, content
-                if isinstance(content, dict):
-                    # sometimes {'type':'text','text':'...'}
-                    if "text" in content:
-                        return True, content["text"]
+                if isinstance(content, dict) and "text" in content:
+                    return True, content["text"]
                 if isinstance(content, list):
-                    # list of parts -> join text-like parts
                     parts = []
                     for part in content:
                         if isinstance(part, str):
@@ -202,26 +315,20 @@ class PDFProcessor:
                             if isinstance(text, str):
                                 parts.append(text)
                     return True, "\n".join(parts)
-            # fallback to choice["text"]
             if "text" in choice:
                 return True, choice["text"]
             return False, f"Unexpected response shape: {json.dumps(choice)[:400]}"
         except Exception as e:
             return False, f"Could not extract content: {e}"
 
+    # ---------------- Querying ----------------
     def query_document(self, vector_path: str, question: str, chat_history: list, model_name: str = "openai/gpt-4o-mini"):
         if not os.path.exists(vector_path):
             return "Vector DB not found at specified path."
 
-        # Load existing Chroma DB safely (use supported factory if available)
+        # Load existing Chroma DB safely
         try:
-            vectordb = Chroma.from_persist_directory(persist_directory=vector_path, embedding=self.embeddings)
-        except AttributeError:
-            # older/newer wrappers may not provide from_persist_directory; fallback to constructor
-            try:
-                vectordb = Chroma(persist_directory=vector_path, embedding=self.embeddings)
-            except Exception as e:
-                return f"[VECTOR ERROR] Could not load Chroma DB: {e}"
+            vectordb = self._load_chroma_from_persist(vector_path)
         except Exception as e:
             return f"[VECTOR ERROR] Could not load Chroma DB: {e}"
 
@@ -230,13 +337,12 @@ class PDFProcessor:
             if hasattr(vectordb, "similarity_search"):
                 results = vectordb.similarity_search(question, k=3)
             else:
-                # use retriever interface
                 if hasattr(vectordb, "as_retriever"):
                     retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-                    # many retrievers provide get_relevant_documents()
                     if hasattr(retriever, "get_relevant_documents"):
                         results = retriever.get_relevant_documents(question)
                     else:
+                        # some retrievers are callable
                         results = retriever(question)
                 else:
                     return "[VECTOR ERROR] Vector store does not support retrieval."
@@ -360,9 +466,6 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
-
-
-
 
 
 
