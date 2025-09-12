@@ -11,30 +11,35 @@ import streamlit as st
 from pathlib import Path
 from typing import Union
 
-# LangChain community imports (for loaders & splitting)
+# LangChain community imports (for loaders & vector DB)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 
-# chromadb (we force duckdb+parquet backend to avoid SQLite issues on some systems)
-import chromadb
+# force Chroma to use SQLite
 from chromadb.config import Settings
+import chromadb
 
+# ✅ explicitly tell Chroma to use SQLite (not DuckDB)
+chroma_client = chromadb.PersistentClient(
+    path="analytics_chroma",
+    settings=Settings(chroma_db_impl="sqlite")
+)
 
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
         # embedding model (sentence-transformers)
-        # Using the same model you had originally
         self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
-        # Where vector DBs are stored (relative to app directory)
+        # Where vector DBs are stored
         if vector_db_root is None:
             self.vector_db_root = Path(os.getcwd()) / "analytics_chroma"
         else:
             self.vector_db_root = Path(vector_db_root)
         self.vector_db_root.mkdir(parents=True, exist_ok=True)
 
-        # OpenRouter API key (from Streamlit secrets or env)
+        # OpenRouter API key
         api_key = None
         try:
             api_key = st.secrets.get("OPENROUTER_API_KEY") if getattr(st, "secrets", None) else None
@@ -42,18 +47,9 @@ class PDFProcessor:
             api_key = None
         if not api_key:
             api_key = os.environ.get("OPENROUTER_API_KEY")
-        self.openrouter_api_key = api_key  # may be None (we handle that later)
+        self.openrouter_api_key = api_key
 
-        # OpenRouter endpoint (Chat Completions)
         self.openrouter_endpoint = "https://openrouter.ai/api/v1/chat/completions"
-
-    def _get_chroma_client(self, vector_path: str):
-        """Return a chromadb.PersistentClient pointed at vector_path using duckdb+parquet backend."""
-        # ensure directory exists
-        Path(vector_path).mkdir(parents=True, exist_ok=True)
-        settings = Settings(chroma_db_impl="duckdb+parquet")
-        client = chromadb.PersistentClient(path=str(vector_path), settings=settings)
-        return client
 
     def _save_uploaded_pdf(self, uploaded_file) -> str:
         suffix = ".pdf"
@@ -66,12 +62,7 @@ class PDFProcessor:
         return str(file_path)
 
     def process_pdf(self, pdf_source: Union[str, "UploadedFile"]):
-        """Process PDF and create or reuse a Chroma (chromadb) vector DB. Returns vector_path or None.
-
-        Key changes from the original:
-        - Uses chromadb.PersistentClient with duckdb+parquet backend (avoids SQLite issues)
-        - Stores documents and precomputed embeddings directly into a chromadb collection
-        """
+        """Process PDF and create or reuse a Chroma vector DB."""
         is_temp = False
         pdf_path = None
         try:
@@ -99,46 +90,18 @@ class PDFProcessor:
             text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             chunks = text_splitter.split_documents(documents)
 
-            # Prepare data lists
-            docs_texts = [c.page_content for c in chunks]
-            metadatas = [getattr(c, "metadata", {}) or {} for c in chunks]
-            ids = [f"{db_name}_{i}_{uuid.uuid4().hex}" for i in range(len(chunks))]
-
-            # Compute embeddings (with fallback if method names vary)
-            if hasattr(self.embeddings, "embed_documents"):
-                vectors = self.embeddings.embed_documents(docs_texts)
-            elif hasattr(self.embeddings, "embed"):
-                vectors = [self.embeddings.embed(d) for d in docs_texts]
-            else:
-                raise RuntimeError("Embedding method not available on SentenceTransformerEmbeddings instance")
-
-            # Ensure vector folder exists before writing
+            # Ensure vector folder exists
             os.makedirs(vector_path, exist_ok=True)
 
-            # Create chromadb client (duckdb backend) and collection
-            client = self._get_chroma_client(vector_path)
-            collection_name = db_name.replace(" ", "_")
+            # ✅ Force Chroma to use SQLite backend
+            vectordb = Chroma.from_documents(
+                documents=chunks,
+                embedding=self.embeddings,
+                persist_directory=vector_path,
+                client_settings=Settings(chroma_db_impl="sqlite")
+            )
+            vectordb.persist()
 
-            # get_or_create_collection is convenient; it will return existing collection or create new
-            try:
-                collection = client.get_or_create_collection(name=collection_name)
-            except Exception:
-                # fallback for older chromadb versions
-                try:
-                    collection = client.get_collection(name=collection_name)
-                except Exception:
-                    collection = client.create_collection(name=collection_name)
-
-            # Add documents with precomputed embeddings
-            collection.add(documents=docs_texts, metadatas=metadatas, ids=ids, embeddings=vectors)
-            # persist to disk
-            try:
-                client.persist()
-            except Exception:
-                # some chromadb builds persist automatically; ignore if not available
-                pass
-
-            # mark processed
             with open(flag_path, "w") as f:
                 f.write("processed")
 
@@ -157,11 +120,8 @@ class PDFProcessor:
             gc.collect()
 
     def _call_openrouter(self, messages: list, model: str = "openai/gpt-4o-mini", max_tokens: int = 600):
-        """
-        Direct HTTP call to OpenRouter chat completions. Returns (ok: bool, content_or_error).
-        """
         if not self.openrouter_api_key:
-            return False, "OPENROUTER_API_KEY not configured (Streamlit Secrets or env)."
+            return False, "OPENROUTER_API_KEY not configured."
 
         payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
         headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
@@ -181,30 +141,15 @@ class PDFProcessor:
         try:
             data = resp.json()
         except Exception as e:
-            return False, f"Invalid JSON response from OpenRouter: {e}"
+            return False, f"Invalid JSON response: {e}"
 
-        # extract content from known shapes
         try:
             choice = data["choices"][0]
-            # OpenRouter (OpenAI compatible) often uses choice["message"]["content"]
             msg = choice.get("message")
             if isinstance(msg, dict):
                 content = msg.get("content")
                 if isinstance(content, str):
                     return True, content
-                if isinstance(content, dict):
-                    if "text" in content:
-                        return True, content["text"]
-                if isinstance(content, list):
-                    parts = []
-                    for part in content:
-                        if isinstance(part, str):
-                            parts.append(part)
-                        elif isinstance(part, dict):
-                            text = part.get("text") or part.get("content")
-                            if isinstance(text, str):
-                                parts.append(text)
-                    return True, "\n".join(parts)
             if "text" in choice:
                 return True, choice["text"]
             return False, f"Unexpected response shape: {json.dumps(choice)[:400]}"
@@ -213,61 +158,22 @@ class PDFProcessor:
 
     def query_document(self, vector_path: str, question: str, chat_history: list, model_name: str = "openai/gpt-4o-mini"):
         if not os.path.exists(vector_path):
-            return "Vector DB not found at specified path."
+            return "Vector DB not found."
 
-        # Create chromadb client pointed at the vector_path
-        try:
-            client = self._get_chroma_client(vector_path)
-        except Exception as e:
-            return f"[CHROMA ERROR] Could not initialize chroma client: {e}"
+        vectordb = Chroma(
+            persist_directory=vector_path,
+            embedding=self.embeddings,
+            client_settings=Settings(chroma_db_impl="sqlite")
+        )
 
-        collection_name = Path(vector_path).stem.replace(" ", "_")
+        results = vectordb.similarity_search(question, k=3)
+        if not results:
+            return "No relevant information found."
 
-        try:
-            # Try to fetch the collection
-            collection = client.get_collection(name=collection_name)
-        except Exception:
-            # If it doesn't exist or something went wrong, return an informative message
-            return "No vector collection found for this PDF. Make sure the PDF was processed successfully."
+        context = "\n\n".join([r.page_content for r in results])
 
-        # Compute embedding for the question (fallback if method names vary)
-        try:
-            if hasattr(self.embeddings, "embed_query"):
-                q_emb = self.embeddings.embed_query(question)
-            elif hasattr(self.embeddings, "embed_documents"):
-                q_emb = self.embeddings.embed_documents([question])[0]
-            elif hasattr(self.embeddings, "embed"):
-                q_emb = self.embeddings.embed(question)
-            else:
-                raise RuntimeError("Embedding method not available for query")
-        except Exception as e:
-            return f"[EMBED ERROR] {e}"
-
-        # Query chroma collection
-        try:
-            resp = collection.query(query_embeddings=[q_emb], n_results=3, include=["documents", "metadatas", "distances"]) 
-            # resp shape is typically {'ids': [[...]], 'documents': [[...]], 'metadatas': [[...]], 'distances': [[...]]}
-            docs = []
-            if isinstance(resp, dict):
-                docs = resp.get("documents", [[]])[0] if resp.get("documents") else []
-            # ensure we have results
-            if not docs:
-                return "No relevant information found."
-
-            context = "\n\n".join(docs)
-
-        except Exception as e:
-            return f"[SEARCH ERROR] {e}"
-
-        # Build messages and call LLM
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a subject expert assistant. Answer using the context from the PDF like a textbook solution. "
-                    "Include LaTeX formulas ($$...$$) where relevant; be precise and step-by-step."
-                )
-            }
+            {"role": "system", "content": "You are a subject expert assistant. Answer using the PDF context like a textbook solution."}
         ]
 
         for q, a in chat_history:
@@ -292,13 +198,13 @@ processor = PDFProcessor()
 
 # Sidebar / settings
 st.sidebar.header("⚙️ Settings")
-model_choice = st.sidebar.selectbox("Choose model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"]) 
-st.sidebar.markdown("Vector DBs saved under `analytics_chroma/` in the app folder.")
+model_choice = st.sidebar.selectbox("Choose model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"])
+st.sidebar.markdown("Vector DBs saved under `analytics_chroma/`.")
 st.sidebar.markdown("Add `OPENROUTER_API_KEY` in Streamlit Secrets before using the model.")
 
 # Upload / sample selection
 st.subheader("Upload or select a PDF")
-uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"]) 
+uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"])
 
 sample_path = Path("sample_pdfs")
 sample_pdfs = []
@@ -310,7 +216,6 @@ if sample_pdfs:
 else:
     chosen = "-- none --"
 
-# Use session_state to keep selected vector DB across reruns
 if "vector_path" not in st.session_state:
     st.session_state["vector_path"] = None
 
@@ -330,16 +235,16 @@ else:
                     st.success("PDF processed and vector DB created.")
                     st.session_state["vector_path"] = vector_path
 
-# show existing processed DBs (only directories with processed.flag)
+# show existing processed DBs
 existing_dbs = sorted(
     [str(p) for p in Path(processor.vector_db_root).iterdir() if p.is_dir() and (p / "processed.flag").exists()]
 )
 if existing_dbs:
-    db_choice = st.selectbox("Or pick an existing processed PDF (vector DB)", ["-- pick --"] + existing_dbs)
+    db_choice = st.selectbox("Or pick an existing processed PDF", ["-- pick --"] + existing_dbs)
     if db_choice != "-- pick --":
         st.session_state["vector_path"] = db_choice
 
-st.subheader("💬 Ask questions (once a vector DB is selected)")
+st.subheader("💬 Ask questions")
 vector_path = st.session_state.get("vector_path")
 if vector_path:
     if "chat_history" not in st.session_state:
@@ -366,9 +271,10 @@ if vector_path:
             st.markdown(f"**Bot:** {a}")
             st.markdown("---")
 else:
-    st.info("No vector DB selected / processed yet. Upload or choose a PDF and click 'Process'.")
+    st.info("No vector DB selected. Upload or choose a PDF and click 'Process'.")
 
-# housekeeping
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
+
