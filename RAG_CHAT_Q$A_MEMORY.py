@@ -8,7 +8,7 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import Chroma
 from langchain.embeddings import SentenceTransformerEmbeddings
 
-
+os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
 # ===============================
 # PDF Processor Class
 # ===============================
@@ -150,5 +150,6 @@ for q, a in st.session_state.chat_history:
     st.markdown(f"** You:** {q}")
     st.markdown(f"** Bot:** {a}")
     st.markdown("---")
+
 
 
