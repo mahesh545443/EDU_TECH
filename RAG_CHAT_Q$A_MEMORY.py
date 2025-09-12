@@ -1,4 +1,5 @@
 # RAG_CHAT_Q$A_MEMORY.py
+# RAG_CHAT_Q$A_MEMORY.py
 import os
 # disable aggressive file watching (must be set before importing streamlit)
 os.environ["WATCHFILES_DISABLE"] = "1"
@@ -55,6 +56,7 @@ class PDFProcessor:
         return str(file_path)
 
     def process_pdf(self, pdf_source: Union[str, "UploadedFile"]):
+        """Process PDF and create or reuse a Chroma vector DB. Returns vector_path or None."""
         is_temp = False
         pdf_path = None
         try:
@@ -71,23 +73,29 @@ class PDFProcessor:
             db_name = Path(pdf_path).stem
             vector_path = str(self.vector_db_root / db_name)
             flag_path = os.path.join(vector_path, "processed.flag")
+
             if os.path.exists(flag_path):
                 st.info("This PDF was already processed. Reusing existing vector DB.")
                 return vector_path
 
+            # Load + split
             loader = PyPDFLoader(pdf_path)
             documents = loader.load()
             text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             chunks = text_splitter.split_documents(documents)
 
+            # Ensure vector folder exists before writing
+            os.makedirs(vector_path, exist_ok=True)
+
+            # Build Chroma DB using new 'embedding' kwarg
             vectordb = Chroma.from_documents(
                 documents=chunks,
-                embedding_function=self.embeddings,
+                embedding=self.embeddings,
                 persist_directory=vector_path
             )
             vectordb.persist()
 
-            os.makedirs(vector_path, exist_ok=True)
+            # mark processed
             with open(flag_path, "w") as f:
                 f.write("processed")
 
@@ -107,21 +115,13 @@ class PDFProcessor:
 
     def _call_openrouter(self, messages: list, model: str = "openai/gpt-4o-mini", max_tokens: int = 600):
         """
-        Direct HTTP call to OpenRouter chat completions.
-        Returns (success_bool, content_or_error_message).
+        Direct HTTP call to OpenRouter chat completions. Returns (ok: bool, content_or_error).
         """
         if not self.openrouter_api_key:
-            return False, "OPENROUTER_API_KEY not configured (in Streamlit secrets or env)."
+            return False, "OPENROUTER_API_KEY not configured (Streamlit Secrets or env)."
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens
-        }
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json"
-        }
+        payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
+        headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
 
         try:
             resp = requests.post(self.openrouter_endpoint, headers=headers, json=payload, timeout=60)
@@ -129,7 +129,6 @@ class PDFProcessor:
             return False, f"Network error when calling OpenRouter: {e}"
 
         if resp.status_code != 200:
-            # return short debug info (avoid leaking sensitive info)
             try:
                 body = resp.json()
             except Exception:
@@ -141,13 +140,31 @@ class PDFProcessor:
         except Exception as e:
             return False, f"Invalid JSON response from OpenRouter: {e}"
 
-        # Extract content: supports OpenAI-compatible response shape
+        # extract content from known shapes
         try:
             choice = data["choices"][0]
-            # Newer OpenRouter responses use choice['message']['content']
-            if "message" in choice and "content" in choice["message"]:
-                return True, choice["message"]["content"]
-            # Fallback to text field
+            # OpenRouter (OpenAI compatible) often uses choice["message"]["content"]
+            msg = choice.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return True, content
+                if isinstance(content, dict):
+                    # sometimes {'type':'text','text':'...'}
+                    if "text" in content:
+                        return True, content["text"]
+                if isinstance(content, list):
+                    # list of parts -> join text-like parts
+                    parts = []
+                    for part in content:
+                        if isinstance(part, str):
+                            parts.append(part)
+                        elif isinstance(part, dict):
+                            text = part.get("text") or part.get("content")
+                            if isinstance(text, str):
+                                parts.append(text)
+                    return True, "\n".join(parts)
+            # fallback to choice["text"]
             if "text" in choice:
                 return True, choice["text"]
             return False, f"Unexpected response shape: {json.dumps(choice)[:400]}"
@@ -158,10 +175,8 @@ class PDFProcessor:
         if not os.path.exists(vector_path):
             return "Vector DB not found at specified path."
 
-        vectordb = Chroma(
-            persist_directory=vector_path,
-            embedding_function=self.embeddings
-        )
+        # Use new 'embedding' kwarg when creating Chroma client
+        vectordb = Chroma(persist_directory=vector_path, embedding=self.embeddings)
 
         results = vectordb.similarity_search(question, k=3)
         if not results:
@@ -199,14 +214,13 @@ st.title("📄 PDF Q&A Assistant")
 
 processor = PDFProcessor()
 
+# Sidebar / settings
 st.sidebar.header("⚙️ Settings")
-model_choice = st.sidebar.selectbox(
-    "Choose model",
-    ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"]
-)
-st.sidebar.markdown("Vector DB storage: `analytics_chroma/` in app folder.")
-st.sidebar.markdown("Add `OPENROUTER_API_KEY` in Streamlit Secrets before asking questions.")
+model_choice = st.sidebar.selectbox("Choose model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"])
+st.sidebar.markdown("Vector DBs saved under `analytics_chroma/` in the app folder.")
+st.sidebar.markdown("Add `OPENROUTER_API_KEY` in Streamlit Secrets before using the model.")
 
+# Upload / sample selection
 st.subheader("Upload or select a PDF")
 uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"])
 
@@ -220,13 +234,17 @@ if sample_pdfs:
 else:
     chosen = "-- none --"
 
-vector_path = None
+# Use session_state to keep selected vector DB across reruns
+if "vector_path" not in st.session_state:
+    st.session_state["vector_path"] = None
+
 if uploaded is not None:
     if st.button("Process uploaded PDF"):
         with st.spinner("Processing uploaded PDF..."):
             vector_path = processor.process_pdf(uploaded)
             if vector_path:
                 st.success("PDF processed and vector DB created.")
+                st.session_state["vector_path"] = vector_path
 else:
     if chosen != "-- select --" and chosen != "-- none --":
         if st.button("Process selected repo PDF"):
@@ -234,14 +252,19 @@ else:
                 vector_path = processor.process_pdf(chosen)
                 if vector_path:
                     st.success("PDF processed and vector DB created.")
+                    st.session_state["vector_path"] = vector_path
 
-existing_dbs = sorted([str(p) for p in Path(processor.vector_db_root).iterdir() if p.is_dir()])
+# show existing processed DBs (only directories with processed.flag)
+existing_dbs = sorted(
+    [str(p) for p in Path(processor.vector_db_root).iterdir() if p.is_dir() and (p / "processed.flag").exists()]
+)
 if existing_dbs:
     db_choice = st.selectbox("Or pick an existing processed PDF (vector DB)", ["-- pick --"] + existing_dbs)
     if db_choice != "-- pick --":
-        vector_path = db_choice
+        st.session_state["vector_path"] = db_choice
 
 st.subheader("💬 Ask questions (once a vector DB is selected)")
+vector_path = st.session_state.get("vector_path")
 if vector_path:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -269,9 +292,12 @@ if vector_path:
 else:
     st.info("No vector DB selected / processed yet. Upload or choose a PDF and click 'Process'.")
 
+# housekeeping
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
+
 
 
 
