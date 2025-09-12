@@ -1,4 +1,5 @@
 # RAG_CHAT_Q$A_MEMORY.py — updated for Streamlit Cloud (SQLite/Chroma + embeddings fix)
+# RAG_CHAT_Q$A_MEMORY.py — final updated version for Streamlit Cloud
 import os
 
 # disable aggressive file watching (must be set before importing streamlit)
@@ -56,12 +57,10 @@ except Exception:
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
         # embedding model (sentence-transformers)
-        # model name: keep same style as before; you may use "sentence-transformers/all-MiniLM-L6-v2" if needed
         try:
-            # HuggingFaceEmbeddings and SentenceTransformerEmbeddings both accept model_name in many setups
             self.embeddings = EmbeddingsClass(model_name="all-MiniLM-L6-v2")
         except TypeError:
-            # some wrappers use a different kwarg; try positional
+            # some wrappers accept positional arg
             self.embeddings = EmbeddingsClass("all-MiniLM-L6-v2")
 
         # Where vector DBs are stored (relative to app directory)
@@ -127,7 +126,6 @@ class PDFProcessor:
             os.makedirs(vector_path, exist_ok=True)
 
             # Build Chroma DB using embeddings object
-            # NOTE: `embedding` kwarg used by langchain-community Chroma wrapper
             vectordb = Chroma.from_documents(
                 documents=chunks,
                 embedding=self.embeddings,
@@ -215,10 +213,36 @@ class PDFProcessor:
         if not os.path.exists(vector_path):
             return "Vector DB not found at specified path."
 
-        # Use new 'embedding' kwarg when creating Chroma client
-        vectordb = Chroma(persist_directory=vector_path, embedding=self.embeddings)
+        # Load existing Chroma DB safely (use supported factory if available)
+        try:
+            vectordb = Chroma.from_persist_directory(persist_directory=vector_path, embedding=self.embeddings)
+        except AttributeError:
+            # older/newer wrappers may not provide from_persist_directory; fallback to constructor
+            try:
+                vectordb = Chroma(persist_directory=vector_path, embedding=self.embeddings)
+            except Exception as e:
+                return f"[VECTOR ERROR] Could not load Chroma DB: {e}"
+        except Exception as e:
+            return f"[VECTOR ERROR] Could not load Chroma DB: {e}"
 
-        results = vectordb.similarity_search(question, k=3)
+        # Perform retrieval robustly (support similarity_search or retriever)
+        try:
+            if hasattr(vectordb, "similarity_search"):
+                results = vectordb.similarity_search(question, k=3)
+            else:
+                # use retriever interface
+                if hasattr(vectordb, "as_retriever"):
+                    retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+                    # many retrievers provide get_relevant_documents()
+                    if hasattr(retriever, "get_relevant_documents"):
+                        results = retriever.get_relevant_documents(question)
+                    else:
+                        results = retriever(question)
+                else:
+                    return "[VECTOR ERROR] Vector store does not support retrieval."
+        except Exception as e:
+            return f"[VECTOR QUERY ERROR] {e}"
+
         if not results:
             return "No relevant information found."
 
@@ -336,6 +360,7 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
 
 
 
