@@ -1,9 +1,29 @@
-# RAG_CHAT_Q$A_MEMORY.py
+# RAG_CHAT_Q$A_MEMORY.py — updated for Streamlit Cloud (SQLite/Chroma + embeddings fix)
 import os
+
 # disable aggressive file watching (must be set before importing streamlit)
 os.environ["WATCHFILES_DISABLE"] = "1"
 os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
 
+# --- Ensure a newer SQLite is used (pysqlite3-binary must be in requirements.txt) ---
+import sys
+try:
+    # prefer pysqlite3.dbapi2 if available
+    import pysqlite3.dbapi2 as _pysqlite_dbapi
+    sys.modules["sqlite3"] = _pysqlite_dbapi
+except Exception:
+    try:
+        import pysqlite3 as _pysqlite3
+        sys.modules["sqlite3"] = _pysqlite3
+    except Exception:
+        # fallback: system sqlite3 (may be old)
+        pass
+
+# suppress noisy torch internal warning (optional)
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.classes.*")
+
+# standard imports
 import gc
 import uuid
 import json
@@ -13,16 +33,36 @@ from pathlib import Path
 from typing import Union
 
 # LangChain community imports (for loaders & vector DB)
+# (Import these AFTER the sqlite fix)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+
+# Embeddings: prefer langchain-huggingface; fall back if necessary
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings as _HuggingFaceEmbeddings
+    EmbeddingsClass = _HuggingFaceEmbeddings
+except Exception:
+    try:
+        # older langchain layout fallback
+        from langchain.embeddings import HuggingFaceEmbeddings as _HuggingFaceEmbeddings2
+        EmbeddingsClass = _HuggingFaceEmbeddings2
+    except Exception:
+        # last fallback to community sentence-transformer embeddings
+        from langchain_community.embeddings import SentenceTransformerEmbeddings as _SentenceTransformerEmbeddings
+        EmbeddingsClass = _SentenceTransformerEmbeddings
 
 
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
         # embedding model (sentence-transformers)
-        self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+        # model name: keep same style as before; you may use "sentence-transformers/all-MiniLM-L6-v2" if needed
+        try:
+            # HuggingFaceEmbeddings and SentenceTransformerEmbeddings both accept model_name in many setups
+            self.embeddings = EmbeddingsClass(model_name="all-MiniLM-L6-v2")
+        except TypeError:
+            # some wrappers use a different kwarg; try positional
+            self.embeddings = EmbeddingsClass("all-MiniLM-L6-v2")
 
         # Where vector DBs are stored (relative to app directory)
         if vector_db_root is None:
@@ -86,7 +126,8 @@ class PDFProcessor:
             # Ensure vector folder exists before writing
             os.makedirs(vector_path, exist_ok=True)
 
-            # Build Chroma DB using new 'embedding' kwarg
+            # Build Chroma DB using embeddings object
+            # NOTE: `embedding` kwarg used by langchain-community Chroma wrapper
             vectordb = Chroma.from_documents(
                 documents=chunks,
                 embedding=self.embeddings,
@@ -295,6 +336,8 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
+
 
 
 
