@@ -4,3 +4,7 @@ requests
 langchain
 pymongo
 PyPDFLoader
+langchain-community
+chromadb
+sentence-transformers
+pypdf
