@@ -1,27 +1,30 @@
 import os
 import gc
 import streamlit as st
-import openai
+from openai import OpenAI
 
-from langchain.document_loaders import PyPDFLoader
+# ✅ Updated imports for LangChain v0.1+
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.embeddings import SentenceTransformerEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import SentenceTransformerEmbeddings
 
+# Disable Streamlit file-watching (fix for inotify error)
 os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
+
 # ===============================
 # PDF Processor Class
 # ===============================
 class PDFProcessor:
     def __init__(self):
         self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-        self.vector_db_path = r"C:\Users\User\analytics_chroma" #create one vector folder 
+        self.vector_db_path = r"C:\Users\User\analytics_chroma"  # create one vector folder
         os.makedirs(self.vector_db_path, exist_ok=True)
 
         # ✅ Initialize OpenRouter client directly
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-             api_key = st.secrets["OPENROUTER_API_KEY"]  # 🔑 replace with your valid key
+            api_key=st.secrets["OPENROUTER_API_KEY"]  # 🔑 replace with your valid key
         )
 
     def process_pdf(self, pdf_path):
@@ -121,13 +124,16 @@ st.title("📄 PDF Q&A Assistant")
 
 processor = PDFProcessor()
 
-# ✅ Fixed PDF path as u have
+# ✅ Fixed PDF path (change as needed)
 pdf_path = r"C:\Users\User\Downloads\keph201.pdf"
 vector_path = processor.process_pdf(pdf_path)
 
 # Sidebar settings
 st.sidebar.header("⚙️ Settings")
-model_choice = st.sidebar.selectbox("Choose Model", ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"])
+model_choice = st.sidebar.selectbox(
+    "Choose Model",
+    ["openai/gpt-4o-mini", "openai/gpt-4o", "mistralai/mixtral-8x7b-instruct"]
+)
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -150,6 +156,3 @@ for q, a in st.session_state.chat_history:
     st.markdown(f"** You:** {q}")
     st.markdown(f"** Bot:** {a}")
     st.markdown("---")
-
-
-
