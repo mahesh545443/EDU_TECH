@@ -1,4 +1,5 @@
 import os
+os.environ["WATCHFILES_DISABLE"] = "1"  # fix for inotify error
 import gc
 import streamlit as st
 from openai import OpenAI
@@ -11,7 +12,7 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 
 # Disable Streamlit file-watching (fix for inotify error)
 os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
-os.environ["WATCHFILES_DISABLE"] = "1"  # fix for inotify error
+
 
 # ===============================
 # PDF Processor Class
@@ -157,4 +158,5 @@ for q, a in st.session_state.chat_history:
     st.markdown(f"** You:** {q}")
     st.markdown(f"** Bot:** {a}")
     st.markdown("---")
+
 
