@@ -1,11 +1,11 @@
 # RAG_CHAT_Q$A_MEMORY.py
+# RAG_CHAT_Q$A_MEMORY.py
 import os
-# Disable aggressive file watching (fixes inotify errors in hosted envs)
+# disable aggressive file watching (must be set before importing streamlit)
 os.environ["WATCHFILES_DISABLE"] = "1"
 os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
 
 import gc
-import tempfile
 import uuid
 import streamlit as st
 from openai import OpenAI
@@ -25,6 +25,7 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 class PDFProcessor:
     def __init__(self, vector_db_root: Union[str, Path] = None):
         # embedding model (sentence-transformers)
+        # NOTE: this will download the model the first time it's used
         self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
         # Where vector DBs are stored (relative to app directory)
@@ -34,19 +35,48 @@ class PDFProcessor:
             self.vector_db_root = Path(vector_db_root)
         self.vector_db_root.mkdir(parents=True, exist_ok=True)
 
-        # OpenRouter/OpenAI client
-        api_key = st.secrets.get("OPENROUTER_API_KEY") if hasattr(st, "secrets") else os.environ.get("OPENROUTER_API_KEY")
+        # OpenRouter/OpenAI client initialization (defensive)
+        api_key = None
+        try:
+            api_key = st.secrets.get("OPENROUTER_API_KEY") if getattr(st, "secrets", None) else None
+        except Exception:
+            api_key = None
         if not api_key:
-            st.warning("OPENROUTER_API_KEY not found in Streamlit secrets or env. Add it before calling the model.")
+            api_key = os.environ.get("OPENROUTER_API_KEY")  # fallback to env var
+
+        if not api_key:
+            st.warning("OPENROUTER_API_KEY not found in Streamlit secrets or environment. Add it before using the model.")
             self.client = None
         else:
-            # initialize client and set OpenRouter base URL
-            self.client = OpenAI(api_key=api_key)
-            # openai.OpenAI client supports setting base_url attribute
-            self.client.base_url = "https://openrouter.ai/api/v1"
+            # Try to construct OpenAI client safely and set OpenRouter base URL.
+            # Some openai versions accept api_key in constructor, others don't — we handle both.
+            self.client = None
+            try:
+                # Try direct constructor (works for many versions)
+                self.client = OpenAI(api_key=api_key)
+                # set base url for OpenRouter
+                try:
+                    self.client.base_url = "https://openrouter.ai/api/v1"
+                except Exception:
+                    # If setting attribute fails, set environment vars and recreate
+                    os.environ["OPENAI_API_KEY"] = api_key
+                    os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+                    self.client = OpenAI()
+            except TypeError:
+                # fallback: set env vars and construct client without params
+                os.environ["OPENAI_API_KEY"] = api_key
+                os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+                try:
+                    self.client = OpenAI()
+                except Exception as e:
+                    st.error(f"Failed to initialize OpenAI client (fallback): {e}")
+                    self.client = None
+            except Exception as e:
+                st.error(f"Failed to initialize OpenAI client: {e}")
+                self.client = None
 
     def _save_uploaded_pdf(self, uploaded_file) -> str:
-        """Save a streamlit uploaded file to a temp file and return file path."""
+        """Save a streamlit uploaded file to a file under analytics_chroma/tmp_uploads and return file path."""
         suffix = ".pdf"
         tmp_name = f"{uuid.uuid4().hex}{suffix}"
         tmp_path = self.vector_db_root / "tmp_uploads"
@@ -63,8 +93,8 @@ class PDFProcessor:
          - a Streamlit UploadedFile object
         Returns path to persisted vector DB (folder) or None on error.
         """
-        # handle uploaded file
         is_temp = False
+        pdf_path = None
         try:
             if hasattr(pdf_source, "read"):  # uploaded file
                 pdf_path = self._save_uploaded_pdf(pdf_source)
@@ -83,7 +113,7 @@ class PDFProcessor:
                 st.info("This PDF was already processed. Reusing existing vector DB.")
                 return vector_path
 
-            # Load and split
+            # Load PDF and split into chunks
             loader = PyPDFLoader(pdf_path)
             documents = loader.load()
             text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -109,8 +139,8 @@ class PDFProcessor:
             return None
 
         finally:
-            # cleanup and GC
-            if is_temp:
+            # cleanup temp uploaded file if any
+            if is_temp and pdf_path:
                 try:
                     os.remove(pdf_path)
                 except Exception:
@@ -161,14 +191,11 @@ class PDFProcessor:
                 messages=messages,
                 max_tokens=600
             )
-            # safe extraction (depends on client version)
-            content = None
+            # extract content (support different client versions)
             try:
-                content = resp.choices[0].message.content
+                return resp.choices[0].message.content
             except Exception:
-                # fallback: sometimes response text is in resp.choices[0].text
-                content = getattr(resp.choices[0], "text", str(resp))
-            return content
+                return getattr(resp.choices[0], "text", str(resp))
         except Exception as e:
             return f"[MODEL ERROR] {e}"
 
@@ -181,7 +208,7 @@ st.title("📄 PDF Q&A Assistant")
 
 processor = PDFProcessor()
 
-# Sidebar: small controls
+# Sidebar: controls
 st.sidebar.header("⚙️ Settings")
 model_choice = st.sidebar.selectbox(
     "Choose model",
@@ -191,11 +218,10 @@ model_choice = st.sidebar.selectbox(
 st.sidebar.markdown("**Vector DB storage:** saved to `analytics_chroma/` inside the app folder.")
 st.sidebar.markdown("Add `OPENROUTER_API_KEY` in Streamlit Secrets before asking questions.")
 
-# Upload or use repo file
+# Upload or choose a PDF in repo
 st.subheader("Upload or select a PDF")
 uploaded = st.file_uploader("Upload a PDF (or use sample below)", type=["pdf"])
 
-# If you want to point to a PDF in repo, change this path or add file to repo.
 sample_path = Path("sample_pdfs")
 sample_pdfs = []
 if sample_path.exists():
@@ -221,7 +247,7 @@ else:
                 if vector_path:
                     st.success("PDF processed and vector DB created.")
 
-# If user previously processed, show available vector DBs
+# Show existing vector DBs
 existing_dbs = sorted([str(p) for p in Path(processor.vector_db_root).iterdir() if p.is_dir()])
 if existing_dbs:
     db_choice = st.selectbox("Or pick an existing processed PDF (vector DB)", ["-- pick --"] + existing_dbs)
@@ -243,7 +269,6 @@ if vector_path:
                     st.session_state.get("chat_history", []),
                     model_name=model_choice
                 )
-                # save history
                 st.session_state.chat_history.append((user_input, answer))
         else:
             st.warning("Please type a question.")
@@ -262,5 +287,6 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
 
 
