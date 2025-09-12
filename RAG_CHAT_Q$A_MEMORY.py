@@ -20,7 +20,7 @@ class PDFProcessor:
         # ✅ Initialize OpenRouter client directly
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key="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"  # 🔑 replace with your valid key
+             api_key = st.secrets["OPENROUTER_API_KEY"]  # 🔑 replace with your valid key
         )
 
     def process_pdf(self, pdf_path):
@@ -149,3 +149,4 @@ for q, a in st.session_state.chat_history:
     st.markdown(f"** You:** {q}")
     st.markdown(f"** Bot:** {a}")
     st.markdown("---")
+
