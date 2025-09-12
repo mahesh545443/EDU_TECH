@@ -1,7 +1,8 @@
 import os
 import gc
 import streamlit as st
-from openai import OpenAI
+import openai
+
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import Chroma
@@ -149,4 +150,5 @@ for q, a in st.session_state.chat_history:
     st.markdown(f"** You:** {q}")
     st.markdown(f"** Bot:** {a}")
     st.markdown("---")
+
 
