@@ -1,13 +1,31 @@
+# Core
 streamlit==1.37.1
+
+# LangChain
 langchain==0.2.14
 langchain-community==0.2.12
-langchain-huggingface
+langchain-huggingface==0.3.1
+
+# Vector database
 chromadb==0.5.5
+
+# Embeddings
 sentence-transformers==2.7.0
+
+# PDF processing
 pypdf==4.3.1
-requests
-pymongo
-pysqlite3-binary
+
+# HTTP requests
+requests==2.32.5
+
+# MongoDB
+pymongo==4.15.0
+
+# SQLite support
+pysqlite3-binary==0.5.4
+
+# Optional: Improved exception logging
+rich==14.1.0
 
 
 
