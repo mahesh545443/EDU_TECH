@@ -4,7 +4,7 @@
 An AI-powered chatbot that lets you upload PDFs and ask questions with context-aware responses.
 
 ## 🚀 Live Demo
-[Click here to try the app](https://mahesh545443-edu-tech-rag-chat-qa-memory-bcsufb.streamlit.app/)
+[Click here to try the app](https://edutech-sw63app8ga27wxw4wghza3.streamlit.app/)
 
 ---
 
