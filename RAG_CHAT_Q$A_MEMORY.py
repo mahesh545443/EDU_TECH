@@ -1,4 +1,4 @@
-# RAG_CHAT_Q$A_MEMORY.py — final robust version for Streamlit Cloud
+
 # RAG_CHAT_Q$A_MEMORY.py — final robust version (embedding adapter + chroma compatibility)
 import os
 import sys
@@ -501,6 +501,7 @@ else:
 if st.button("Clear chat history"):
     st.session_state.chat_history = []
     st.success("Chat history cleared.")
+
 
 
 
