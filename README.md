@@ -1,4 +1,13 @@
 # 📒 Notebooks
+# Edu-Tech RAG Chatbot with Memory
+
+An AI-powered chatbot that lets you upload PDFs and ask questions with context-aware responses.
+
+## 🚀 Live Demo
+[Click here to try the app](https://mahesh545443-edu-tech-rag-chat-qa-memory-bcsufb.streamlit.app/)
+
+---
+
 
 ### Plagiarism & AI Generator  
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mahesh545443/analytics_avenue/blob/main/Plagiarism%20%26%20AI-Generator.ipynb)
